@@ -58,6 +58,33 @@ FAKE
 chmod +x "$SCRATCH/fakebin/uname"
 check_eq "fake uname reports a phone" "aarch64" "$(PATH="$SCRATCH/fakebin:$PATH" uname -m)"
 
+# Copy the parts of the repo that install.sh reads into a scratch checkout.
+#
+# dist/ is gitignored, because the binaries are CI release assets rather than
+# committed files, so a fresh clone has no dist/ at all. Creating one here is what
+# lets this suite run on CI. It previously copied $ROOT/dist, which only existed
+# on a machine where someone had already run the build; on a clean checkout every
+# copy failed with "cannot stat .../dist" and the suite died before its first
+# assertion.
+#
+# The stub answers --version so install.sh's exec gate passes. The real binary is
+# a foreign architecture here and could never satisfy it. All three arches are
+# written, because install.sh runs uname first and every install path then wants
+# that arch's binary present.
+stage_repo() {
+	local dest="$1"
+	rm -rf "$dest"
+	mkdir -p "$dest/dist"
+	cp -r "$ROOT/bin" "$ROOT/build" "$ROOT/termux" "$ROOT/install.sh" "$dest/"
+	local a
+	for a in arm64 arm amd64; do
+		printf '#!/bin/sh\n[ "$1" = "--version" ] && echo "gh version 9.9.9 (stub %s)"\n' \
+			"$a" >"$dest/dist/gh-$a"
+		chmod +x "$dest/dist/gh-$a"
+	done
+	(cd "$dest/dist" && sha256sum gh-arm64 gh-arm gh-amd64 >SHA256SUMS)
+}
+
 # install.sh needs git and tmux to be present, or it stops before installing
 # anything. If this host lacks one of them, say so rather than reporting a
 # suite that quietly proved less than it claims.
@@ -91,10 +118,15 @@ case "$out" in
 esac
 
 # --- refuses a tampered binary --------------------------------------------
-# A checksum mismatch must stop the install. Copy the dist tree so the real
-# dist/SHA256SUMS is not touched.
-mkdir -p "$SCRATCH/repo"
-cp -r "$ROOT/bin" "$ROOT/build" "$ROOT/dist" "$ROOT/termux" "$ROOT/install.sh" "$SCRATCH/repo/"
+# A checksum mismatch must stop the install. Write both the binary and a matching
+# manifest rather than appending to whatever dist/ held, so this works from a
+# clean checkout where dist/ is empty or absent.
+stage_repo "$SCRATCH/repo"
+printf '#!/bin/sh\n[ "$1" = "--version" ] && echo "gh version 9.9.9 (stub)"\nexit 0\n' \
+	>"$SCRATCH/repo/dist/gh-arm64"
+chmod +x "$SCRATCH/repo/dist/gh-arm64"
+(cd "$SCRATCH/repo/dist" && sha256sum gh-arm64 >SHA256SUMS)
+# Now break it, so the recorded hash no longer matches the file.
 printf 'tampered\n' >>"$SCRATCH/repo/dist/gh-arm64"
 # Start from an empty prefix: an earlier case may have left a gh in place, and
 # "already exists" would mask the thing this case is checking.
@@ -117,8 +149,7 @@ fi
 # stopping at the checksum: a mode-000 file fails both, and the checksum firing
 # first is correct but tests nothing new here.
 rm -rf "$SCRATCH/repo"
-mkdir -p "$SCRATCH/repo"
-cp -r "$ROOT/bin" "$ROOT/build" "$ROOT/dist" "$ROOT/termux" "$ROOT/install.sh" "$SCRATCH/repo/"
+stage_repo "$SCRATCH/repo"
 rm -f "$SCRATCH/repo/dist/SHA256SUMS"
 printf '#!/bin/sh\nexit 127\n' >"$SCRATCH/repo/dist/gh-arm64"
 chmod 000 "$SCRATCH/repo/dist/gh-arm64"
@@ -142,8 +173,7 @@ fi
 # Fresh copy of the repo: the case above left a mode-000 file, which cannot be
 # rewritten in place.
 rm -rf "$SCRATCH/repo"
-mkdir -p "$SCRATCH/repo"
-cp -r "$ROOT/bin" "$ROOT/build" "$ROOT/dist" "$ROOT/termux" "$ROOT/install.sh" "$SCRATCH/repo/"
+stage_repo "$SCRATCH/repo"
 rm -f "$SCRATCH/repo/dist/SHA256SUMS"
 printf '#!/bin/sh\nif [ "$1" = "--version" ]; then exit 127; fi\nexit 0\n' \
 	>"$SCRATCH/repo/dist/gh-arm64"
@@ -180,8 +210,7 @@ rm -f "$SCRATCH/fakebin/gh"
 
 # --- refuses to clobber without --force -----------------------------------
 rm -rf "$SCRATCH/repo"
-mkdir -p "$SCRATCH/repo"
-cp -r "$ROOT/bin" "$ROOT/build" "$ROOT/dist" "$ROOT/termux" "$ROOT/install.sh" "$SCRATCH/repo/"
+stage_repo "$SCRATCH/repo"
 touch "$SCRATCH/usr/bin/gh"
 out="$(PATH="$SCRATCH/fakebin:$PATH" PREFIX="$SCRATCH/usr" TERMUX_HOME="$SCRATCH/home" \
 	bash "$SCRATCH/repo/install.sh" 2>&1 || true)"
@@ -397,22 +426,7 @@ fi
 # --- per-arch selection -----------------------------------------------------
 #
 # The repo now ships arm64, arm and amd64. Each of these checks one arch's
-# install path in a clean prefix, using a runnable stub for gh where the real
-# binary is a foreign architecture.
-
-# A stub that satisfies the --version gate, so the rest of the install runs.
-make_stub_repo() {
-	local dest="$1"
-	rm -rf "$dest"
-	mkdir -p "$dest/dist"
-	cp -r "$ROOT/bin" "$ROOT/build" "$ROOT/termux" "$ROOT/install.sh" "$dest/"
-	printf '#!/bin/sh\n[ "$1" = "--version" ] && echo "gh version 9.9.9 (stub)"\nexit 0\n' \
-		>"$dest/dist/gh-arm64"
-	cp "$dest/dist/gh-arm64" "$dest/dist/gh-arm"
-	cp "$dest/dist/gh-arm64" "$dest/dist/gh-amd64"
-	chmod +x "$dest/dist/gh-arm64" "$dest/dist/gh-arm" "$dest/dist/gh-amd64"
-	(cd "$dest/dist" && sha256sum gh-arm64 gh-arm gh-amd64 >SHA256SUMS)
-}
+# install path in a clean prefix, using stage_repo above for the checkout.
 
 fake_uname() {
 	printf '#!/bin/bash\n[ "${1:-}" = "-m" ] && echo %s || /usr/bin/uname "$@"\n' "$1" \
@@ -431,7 +445,7 @@ fake_uname() {
 for pair in "arm64:aarch64" "arm:armv7l" "amd64:x86_64"; do
 	arch="${pair%%:*}"
 	machine="${pair##*:}"
-	make_stub_repo "$SCRATCH/archrepo"
+	stage_repo "$SCRATCH/archrepo"
 	fake_uname "$machine"
 	prefix="$SCRATCH/arch-$arch"
 	rm -rf "$prefix"
@@ -468,7 +482,7 @@ done
 # The binary-selection check above must be able to fail. Confirm by making the
 # wrong binary the only one present: installing on an arm64 device with only
 # gh-arm available must not silently install gh-arm.
-make_stub_repo "$SCRATCH/archrepo"
+stage_repo "$SCRATCH/archrepo"
 fake_uname aarch64
 rm -f "$SCRATCH/archrepo/dist/gh-arm64" "$SCRATCH/archrepo/dist/gh-amd64"
 printf '#!/bin/sh\necho "I-AM-arm"\nexit 0\n' >"$SCRATCH/archrepo/dist/gh-arm"
@@ -491,7 +505,7 @@ fi
 # recorded hash matches the corrupt file and the test proves nothing. An earlier
 # version regenerated the manifest afterwards and so passed for the wrong
 # reason, never reaching install.sh's per-line fallback.
-make_stub_repo "$SCRATCH/archrepo"
+stage_repo "$SCRATCH/archrepo"
 fake_uname armv7l
 prefix="$SCRATCH/arch-sibling"
 rm -rf "$prefix"
@@ -505,7 +519,7 @@ case "$out" in
 esac
 
 # And the converse: a corrupt binary for THIS arch must still stop the install.
-make_stub_repo "$SCRATCH/archrepo"
+stage_repo "$SCRATCH/archrepo"
 fake_uname armv7l
 prefix="$SCRATCH/arch-selfcorrupt"
 rm -rf "$prefix"
@@ -524,7 +538,7 @@ else
 fi
 
 # A manifest with no entry for this arch must not silently claim success.
-make_stub_repo "$SCRATCH/archrepo"
+stage_repo "$SCRATCH/archrepo"
 fake_uname armv7l
 printf '%s\n' "$SCRATCH/archrepo/dist/gh-arm64" >"$SCRATCH/archrepo/dist/SHA256SUMS"
 prefix="$SCRATCH/arch-noentry"
@@ -539,7 +553,7 @@ esac
 
 # A missing binary must point at the release, since CI publishes the binaries
 # there rather than committing them.
-make_stub_repo "$SCRATCH/archrepo"
+stage_repo "$SCRATCH/archrepo"
 rm -f "$SCRATCH/archrepo/dist/gh-arm"
 fake_uname armv7l
 prefix="$SCRATCH/arch-missing"

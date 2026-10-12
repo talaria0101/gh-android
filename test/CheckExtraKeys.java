@@ -19,24 +19,6 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * A macro as written in the properties file, plus the tmux key it expands to.
- *
- * Termux expands a macro by splitting on spaces and letting a modifier apply to
- * only the next key (TerminalExtraKeys.onExtraKeyButtonClick). So "CTRL b d" is
- * the prefix key Ctrl-B followed by the command key 'd'. Modelling that here is
- * what lets the test below check the command against tmux's real key table.
- */
-class Macro {
-	final String spec;
-	final String commandKey;
-
-	Macro(String spec, String commandKey) {
-		this.spec = spec;
-		this.commandKey = commandKey;
-	}
-}
-
-/**
  * Validates termux/termux.properties the way Termux itself reads it.
  *
  * Termux loads the file with java.util.Properties and then feeds the

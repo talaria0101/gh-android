@@ -69,15 +69,20 @@ check_eq() {
 	if [ "$2" = "$3" ]; then ok "$1"; else no "$1" "want: $2" "got:  $3"; fi
 }
 
-[ -f "$BIN" ] || {
-	printf 'no %s; run ./build/build-gh.sh first\n' "$BIN" >&2
-	exit 1
-}
+# Nothing here needs a pre-built binary, but the ELF checks do. dist/ is
+# gitignored, because the binaries are CI release assets, so a fresh clone has
+# none until someone builds. Exiting 1 was wrong: on CI this suite runs in the
+# verify job, before the build job, and would fail every push for a missing
+# artifact rather than for a real defect. The execution checks further down build
+# their own linux/ siblings and still run either way.
+if [ ! -f "$BIN" ]; then
+	printf '  SKIP  no built binaries in dist/, so the ELF checks are skipped.\n'
+	printf '        Build one with ./build/build-gh.sh, or --arch arm for 32-bit.\n'
+else
+	# --- structural checks on every shipped binary --------------------------
 
-# --- structural checks on every shipped binary -----------------------------
-
-# check_arch ARCH MACHINE_REGEX INTERCEPT [expect_libc]
-check_arch() {
+	# check_arch ARCH MACHINE_REGEX INTERCEPT [expect_libc]
+	check_arch() {
 	local name="$1" machine_re="$2" interp="$3" expect_libc="${4:-no}"
 	local bin="$ROOT/dist/gh-$name"
 
@@ -136,15 +141,16 @@ check_arch() {
 	esac
 }
 
-check_arch arm64 'AArch64' '/system/bin/linker64' no
-check_arch arm 'ARM' '/system/bin/linker' yes
-check_arch amd64 'X86-64' '/system/bin/linker64' yes
+	check_arch arm64 'AArch64' '/system/bin/linker64' no
+	check_arch arm 'ARM' '/system/bin/linker' yes
+	check_arch amd64 'X86-64' '/system/bin/linker64' yes
 
-# 32-bit must actually be 32-bit. `Machine: ARM` also matches a 64-bit ARM
-# string in some readelf versions, so check the ELF class directly.
-if [ -f "$ROOT/dist/gh-arm" ]; then
-	class="$(readelf -h "$ROOT/dist/gh-arm" 2>/dev/null | sed -n 's/.*Class: *//p')"
-	check_eq "dist/gh-arm is ELF32" "ELF32" "$class"
+	# 32-bit must actually be 32-bit. `Machine: ARM` also matches a 64-bit ARM
+	# string in some readelf versions, so check the ELF class directly.
+	if [ -f "$ROOT/dist/gh-arm" ]; then
+		class="$(readelf -h "$ROOT/dist/gh-arm" 2>/dev/null | sed -n 's/.*Class: *//p')"
+		check_eq "dist/gh-arm is ELF32" "ELF32" "$class"
+	fi
 fi
 
 # --- execute an aarch64 build of the same source ---------------------------

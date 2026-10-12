@@ -53,6 +53,15 @@ jobs:
             https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
           echo "fetched $(stat -c %s test/json.jar) bytes"
 
+      # Build one real artifact before the tests. dist/ is gitignored, because the
+      # binaries ship as release assets, so a fresh checkout has none and
+      # test-binary.sh skips its ELF checks with a message. That skip is fine
+      # locally and wrong on the gate: the one job that runs on every push would
+      # never inspect a real artifact. arm64 only, because it is the one arch that
+      # needs no NDK and builds from a bare Go toolchain, so this costs seconds.
+      - name: Build arm64 so the ELF checks have something to check
+        run: ./build/build-gh.sh --arch arm64
+
       # A JDK is on the runner, but point the suite at it explicitly rather than
       # relying on `java` being the real binary and not a wrapper.
       - name: Run the test suite
