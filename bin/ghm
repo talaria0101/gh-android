@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# ghm - run gh inside a persistent tmux session on Termux.
+#
+# Why this exists: Android kills Termux whenever it wants to, and a gh command
+# that dies with the terminal loses its output, its auth prompt and any running
+# `gh run watch`. tmux detaches the command from the terminal emulator, so the
+# command keeps running while you switch apps, lock the screen or drop the
+# keyboard, and you reattach to the same output later.
+#
+# Usage:
+#   ghm <gh args...>      run gh in a session named for the current repo
+#   ghm ls                list gh sessions
+#   ghm attach [NAME]     reattach to a session
+#   ghm kill [NAME]       kill a session
+#   ghm new <gh args...>  start a fresh session even if one exists
+#   ghm wake              hold a partial wake lock so Android does not freeze us
+#   ghm unwake            drop the wake lock
+#
+# Anything that is not a known subcommand is passed through to gh verbatim, so
+# `ghm pr list` and `gh pr list` behave the same once the session exists.
+# `ghm help` prints this list; `ghm --help` goes to gh.
+
+set -euo pipefail
+
+# A per-repo session name keeps two checkouts from sharing one screen. tmux
+# session names may not contain '.' or ':', so hash the path into a short suffix
+# and sanitise the readable part.
+session_for_dir() {
+	local dir="${1:-$PWD}"
+	local base
+	base="$(basename -- "$dir")"
+	# Anything outside [A-Za-z0-9_-] becomes '-', which tmux accepts.
+	base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-24)"
+	[ -n "$base" ] || base=root
+
+	local sum
+	sum="$(printf '%s' "$dir" | cksum | cut -d' ' -f1)"
+	printf 'gh-%s-%s' "$base" "${sum:0:6}"
+}
+
+default_session() {
+	# Prefer the git repo name when we are inside a work tree: that is what a
+	# human thinks of as "the session for my project". Fall back to the
+	# directory when there is no repo, so ghm still works outside git.
+	local root
+	if root="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -n "$root" ]; then
+		session_for_dir "$root"
+	else
+		session_for_dir "$PWD"
+	fi
+}
+
+usage() {
+	cat <<'EOF'
+ghm - run gh inside a persistent tmux session on Android/Termux
+
+Usage:
+  ghm <gh args...>      run gh in a session named for the current repo
+  ghm ls                list gh sessions
+  ghm attach [NAME]     reattach to a session
+  ghm kill [NAME]       kill a session
+  ghm new <gh args...>  start a fresh session even if one exists
+  ghm wake              hold a partial wake lock so Android does not freeze us
+  ghm unwake            drop the wake lock
+  ghm help              this text
+
+Environment:
+  GHM_SESSION   override the session name
+
+Detach with the tmux prefix then d (see termux/termux.properties for a key that
+does both in one tap). Note that `ghm --help` is passed to gh; use `ghm help`
+for this list.
+EOF
+}
+
+die() {
+	printf 'ghm: %s\n' "$*" >&2
+	exit 1
+}
+
+need_tmux() {
+	command -v tmux >/dev/null 2>&1 ||
+		die "tmux not found. Install it with: pkg install tmux"
+}
+
+# Android freezes background processes under memory pressure even when they are
+# mid-command. termux-wake-lock asks the OS for a partial wakelock, which is what
+# actually keeps a long `gh run watch` alive with the screen off. It is not
+# permissionless on every ROM, so failure here is a warning, not an error.
+wake() {
+	if command -v termux-wake-lock >/dev/null 2>&1; then
+		termux-wake-lock
+		printf 'wake lock held\n'
+	else
+		die "termux-wake-lock not found. Install termux-tools, or run 'pkg install termux-api'"
+	fi
+}
+
+unwake() {
+	if command -v termux-wake-unlock >/dev/null 2>&1; then
+		termux-wake-unlock
+		printf 'wake lock released\n'
+	else
+		die "termux-wake-unlock not found"
+	fi
+}
+
+# Attach to a session, but never hang forever if the session has already gone
+# away between the check and the attach.
+attach_session() {
+	local name="$1"
+	if ! tmux has-session -t "=$name" 2>/dev/null; then
+		die "no session named '$name'"
+	fi
+	tmux attach-session -t "=$name"
+}
+
+# Run gh inside a session. The command string is passed to tmux as a single
+# argument, so shell metacharacters inside the user's gh arguments survive
+# without us re-parsing them here.
+start_session() {
+	local name="$1"
+	shift
+	local cmd=(gh "$@")
+
+	# tmux new-session takes a shell command string, not an argv. Quote each
+	# element so that `gh pr list --label "needs review"` arrives intact.
+	local quoted=""
+	local part
+	for part in "${cmd[@]}"; do
+		quoted+=" $(printf '%q' "$part")"
+	done
+
+	tmux new-session -d -s "=$name" -c "$PWD" "${quoted# }"
+}
+
+list_sessions() {
+	# Only show sessions this wrapper owns, so `ghm ls` stays readable on a
+	# phone where someone may have other tmux work running.
+	tmux list-sessions -F '#{session_name}#{?session_attached, (attached),}' 2>/dev/null |
+		grep -E '^gh-' || printf 'no gh sessions\n'
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+# Bare `ghm` is a typo or a question, not a request to run `gh ''`. Print the
+# usage instead, which is what someone typing it wants.
+if [ -z "$cmd" ]; then
+	usage
+	exit 0
+fi
+
+case "$cmd" in
+ls | list)
+	need_tmux
+	list_sessions
+	;;
+attach)
+	need_tmux
+	attach_session "${1:-${GHM_SESSION:-$(default_session)}}"
+	;;
+kill)
+	need_tmux
+	name="${1:-${GHM_SESSION:-$(default_session)}}"
+	tmux kill-session -t "=$name" 2>/dev/null ||
+		die "no session named '$name'"
+	printf 'killed %s\n' "$name"
+	;;
+new)
+	need_tmux
+	name="${GHM_SESSION:-$(default_session)}"
+	if tmux has-session -t "=$name" 2>/dev/null; then
+		tmux kill-session -t "=$name"
+	fi
+	start_session "$name" "$@"
+	attach_session "$name"
+	;;
+wake)
+	wake
+	;;
+unwake)
+	unwake
+	;;
+help)
+	usage
+	;;
+*)
+	# Everything else, including gh's own flags such as --version and --help,
+	# is a gh invocation. --help is deliberately *not* intercepted: it means the
+	# user wants gh's help, and `ghm help` is how you get this script's.
+	need_tmux
+	name="${GHM_SESSION:-$(default_session)}"
+
+	if tmux has-session -t "=$name" 2>/dev/null; then
+		# Existing session: send the command into it and attach. This is the
+		# common case, where you keep one screen per repo open all day.
+		tmux send-keys -t "=$name" "gh $(printf '%q ' "$cmd" "$@")" Enter
+	else
+		start_session "$name" "$cmd" "$@"
+	fi
+	attach_session "$name"
+	;;
+esac

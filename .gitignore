@@ -1,0 +1,16 @@
+# Built binaries are not committed. They are produced by CI and attached to the
+# tagged release, because three Android binaries are ~130MB and that belongs in
+# release assets rather than in git history.
+dist/
+
+# Test and build scratch. test/run-tests.sh creates these; both can hold a Go
+# module cache, which Go writes read-only.
+.scratch/
+.gomodcache/
+
+# Thrown-away module trees the build script makes for the cgo arches.
+dist/.build-*/
+
+# A relative DIST is a legitimate option, so also ignore the name used in the
+# README's worked example.
+reldist/

@@ -1,0 +1,245 @@
+name: build
+
+# Two jobs, for two reasons.
+#
+# `verify` runs the test suite on every push and pull request. It is the gate:
+# nothing is published unless this passes.
+#
+# `release` builds the three Android binaries and, on a tag, attaches them to a
+# GitHub Release. Binaries are not committed; they are release assets, because
+# three Android binaries are about 130MB and that belongs outside git history.
+#
+# The arches are not symmetric, and that is the whole reason this workflow has
+# any subtlety. Go links android/arm64 internally, so it needs nothing but a Go
+# toolchain. Go refuses to link android/arm and android/amd64 without cgo
+# (internal/platform/supported.go, MustLinkExternal), and external cgo linking
+# needs a C compiler targeting Bionic, which means an Android NDK.
+# See build/build-gh.sh.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/tags/*' }}
+
+env:
+  GH_VERSION: v2.102.0
+  NDK_VERSION: r25c
+
+jobs:
+  verify:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # org.json, so the two Java checks run rather than skipping.
+      - name: Fetch org.json for the Termux config checks
+        run: |
+          curl -sSfLo test/json.jar \
+            https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
+          echo "fetched $(stat -c %s test/json.jar) bytes"
+
+      # A JDK is on the runner, but point the suite at it explicitly rather than
+      # relying on `java` being the real binary and not a wrapper.
+      - name: Run the test suite
+        run: |
+          set -euo pipefail
+          export JAVA="$JAVA_HOME/bin/java"
+          test -x "$JAVA" || JAVA="$(command -v java)"
+          ./test/run-tests.sh
+
+  build:
+    name: build ${{ matrix.arch }}
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      # One arch failing should not hide the others.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            needs_ndk: false
+          - arch: arm
+            needs_ndk: true
+          - arch: amd64
+            needs_ndk: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # The NDK is a 531MB download. Cache it against the exact version, so a
+      # version bump invalidates rather than silently reusing the wrong toolchain.
+      - name: Restore the Android NDK from cache
+        if: matrix.needs_ndk
+        uses: actions/cache@v4
+        with:
+          path: ndk
+          key: ndk-${{ runner.os }}-${{ env.NDK_VERSION }}
+
+      - name: Download and unpack the Android NDK
+        if: matrix.needs_ndk
+        run: |
+          set -euo pipefail
+          if [ -d "ndk/android-ndk-$NDK_VERSION/toolchains" ]; then
+            echo "using cached NDK"
+          else
+            echo "NDK not cached, downloading"
+            curl -sSfL -o ndk.zip \
+              "https://dl.google.com/android/repository/android-ndk-$NDK_VERSION-linux.zip"
+            unzip -q ndk.zip -d ndk
+            rm -f ndk.zip
+          fi
+          ls ndk
+
+      - name: Report the toolchain
+        run: |
+          set -euo pipefail
+          go version
+          if [ "${{ matrix.needs_ndk }}" = "true" ]; then
+            echo "NDK: $(ls ndk)"
+            ls "ndk/android-ndk-$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin" |
+              grep -E 'and(roideabi|oid)[0-9]+-clang$' | head -3
+          fi
+
+      - name: Build ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.needs_ndk }}" = "true" ]; then
+            export ANDROID_NDK_HOME="$PWD/ndk/android-ndk-$NDK_VERSION"
+            ./build/build-gh.sh --arch "${{ matrix.arch }}"
+          else
+            ./build/build-gh.sh --arch "${{ matrix.arch }}"
+          fi
+
+      # Prove the artifact is what it claims before shipping it. The build script
+      # checks the ELF header itself; this adds the version stamp, which is what
+      # keeps a released binary from reporting itself as "dev". Running it is not
+      # possible off-device, so the version is checked as a string in the binary.
+      - name: Check the artifact
+        run: |
+          set -euo pipefail
+          bin="dist/gh-${{ matrix.arch }}"
+          test -x "$bin"
+          file "$bin"
+
+          # The Bionic linker each arch must ask for.
+          case "${{ matrix.arch }}" in
+          arm64 | amd64) interp=/system/bin/linker64 ;;
+          arm) interp=/system/bin/linker ;;
+          esac
+          readelf -l "$bin" | grep -q "$interp" || { echo "expected $interp"; exit 1; }
+
+          if ! grep -qa "${GH_VERSION#v}" "$bin"; then
+            echo "version ${GH_VERSION#v} not found in $bin"
+            exit 1
+          fi
+
+          sha256sum "$bin"
+          ls -l dist/
+
+      # Upload on every build, not just tags: a maintainer can pull the artifact
+      # without cutting a release, and a green run with an artifact is more useful
+      # than a green run with nothing to show.
+      #
+      # The manifest uploaded is a per-arch summary, not a verification file. Each
+      # matrix job only has its own binary, so a SHA256SUMS naming all three would
+      # not verify here, and the release job rebuilds a real one from the three
+      # artifacts anyway.
+      - name: Write a per-arch checksum for the artifact
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum "gh-${{ matrix.arch }}" > "gh-${{ matrix.arch }}.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gh-${{ matrix.arch }}
+          path: |
+            dist/gh-${{ matrix.arch }}
+            dist/gh-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only a tag publishes. On main, the per-arch artifacts are the output.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: gh-*
+          merge-multiple: true
+
+      - name: List what will be published
+        run: |
+          set -euo pipefail
+          ls -l artifacts
+          # Every arch must be present. A partial release would ship without the
+          # file a 32-bit phone user needs, and they would find out only after
+          # downloading something.
+          for a in arm64 arm amd64; do
+            test -f "artifacts/gh-$a" || { echo "missing gh-$a"; exit 1; }
+          done
+
+      # Recompute the manifest from the three artifacts actually downloaded. Each
+      # matrix job uploads only its own binary, and install.sh verifies its own
+      # arch's line from this file, so the release needs one manifest covering all
+      # three. The per-arch .sha256 files are dropped: they would only be a second,
+      # weaker copy of what this one file says.
+      - name: Rebuild and verify SHA256SUMS
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          rm -f ./*.sha256
+          sha256sum gh-arm64 gh-arm gh-amd64 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/gh-arm64
+            artifacts/gh-arm
+            artifacts/gh-amd64
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            GitHub CLI for Android/Termux.
+
+            | Device | Download |
+            | --- | --- |
+            | 64-bit ARM (`aarch64`) | `gh-arm64` |
+            | 32-bit ARM (`armv7l`) | `gh-arm` |
+            | x86_64 emulator | `gh-amd64` |
+
+            Verify before installing:
+
+            ```
+            sha256sum -c SHA256SUMS
+            ```
+
+            On the phone, put the file for your architecture in `dist/` and run
+            `bash install.sh`. If it is missing, `install.sh` prints the exact
+            `gh release download` command for your device.
