@@ -31,6 +31,17 @@ if [ -z "$JAVA" ]; then
 	done
 fi
 
+# javac, for the reason given at compile_java below. Look beside the chosen java
+# first, then in JAVA_HOME, then on PATH.
+JAVAC="${JAVAC:-}"
+if [ -z "$JAVAC" ]; then
+	java_bin_dir="${JAVA:+$(dirname -- "$JAVA")}"
+	for candidate in "${java_bin_dir:+$java_bin_dir/javac}" \
+		"${JAVA_HOME:+$JAVA_HOME/bin/javac}" "$(command -v javac 2>/dev/null || true)"; do
+		[ -n "$candidate" ] && [ -x "$candidate" ] && JAVAC="$candidate" && break
+	done
+fi
+
 failed=0
 ran=0
 skipped=0
@@ -45,6 +56,73 @@ run_suite() {
 	fi
 	failed=$((failed + 1))
 	return 1
+}
+
+# Compile the Java checks once and run them by class name.
+#
+# These were run as `java -cp json.jar CheckExtraKeys.java`, which is
+# single-file source-code mode. That mode leans on two launcher behaviours that
+# differ between JDKs, and both bit this suite:
+#
+#   * Which class is run. JEP 330 picks the first top-level class with a main
+#     method; with Macro in the same file, some JDKs chose Macro and failed with
+#     "can't find main(String[]) method in class: Macro".
+#   * Which sources are compiled. Source-file mode compiles the file named on
+#     the command line and does not put its directory on the source path, so a
+#     sibling Macro.java was invisible: the CI runner failed with "cannot find
+#     symbol: class Macro", while the same command passed locally on JDK 25.
+#
+# A green local run was therefore not evidence about the runner. Compiling first
+# and running a named class is explicit and behaves the same everywhere.
+#
+# Sets JAVA_CP and JAVA_STATUS, one of:
+#   ok    compiled; JAVA_CP holds the classpath
+#   skip  no usable toolchain on this host; the checks did not run
+#   fail  the sources do not compile, which is a defect and not a skip
+#
+# The last case is the reason this function has three outcomes and not two. A
+# missing javac is a host that cannot run the check; a source file that does not
+# compile is a broken repo. Reporting the second as a skip let a suite with a
+# deleted Macro.java exit 0, which is exactly the failure it was written to catch.
+JAVA_CP=""
+JAVA_STATUS=""
+compile_java() {
+	JAVA_CP=""
+	if [ -z "$JAVA" ] || [ ! -x "$JAVA" ]; then
+		JAVA_STATUS=skip
+		printf '  SKIP  no java found (JAVA=%s)\n' "${JAVA:-unset}"
+		return 0
+	fi
+	if [ -z "$JSON_JAR" ] || [ ! -f "$JSON_JAR" ]; then
+		JAVA_STATUS=skip
+		printf '  SKIP  org.json not found (JSON_JAR=%s)\n' "${JSON_JAR:-unset}"
+		printf '        curl -sLo test/json.jar https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar\n'
+		return 0
+	fi
+	if [ -z "$JAVAC" ] || [ ! -x "$JAVAC" ]; then
+		JAVA_STATUS=skip
+		printf '  SKIP  no javac found; a JRE alone cannot compile these checks\n'
+		printf '        JAVA=/path/to/java JAVAC=/path/to/javac JSON_JAR=$PWD/test/json.jar %s\n' "$0"
+		return 0
+	fi
+	local out
+	out="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/gh-android-javac.$$")"
+	mkdir -p "$out" || {
+		JAVA_STATUS=fail
+		printf '  FAIL  could not make a directory for the compiled checks\n'
+		return 1
+	}
+	if ! "$JAVAC" -nowarn -cp "$JSON_JAR" -d "$out" \
+		"$HERE/CheckExtraKeys.java" "$HERE/Macro.java" \
+		"$HERE/CheckReadmeTables.java" 2>&1; then
+		JAVA_STATUS=fail
+		printf '  FAIL  javac could not compile the checks\n'
+		rm -rf "$out"
+		return 1
+	fi
+	JAVA_CP="$out:$JSON_JAR"
+	JAVA_STATUS=ok
+	return 0
 }
 
 # --- shell syntax for every shipped script ---------------------------------
@@ -112,22 +190,26 @@ fi
 printf '\n=== termux extra-keys\n'
 # Check that the paths are usable, not merely that the variables are set: an
 # exported JAVA=/nonexistent is set but broken, and treating that as "found"
-# turns a skip into a confusing failure.
-if [ -n "$JAVA" ] && [ -x "$JAVA" ] && [ -n "$JSON_JAR" ] && [ -f "$JSON_JAR" ]; then
+# turns a skip into a confusing failure. compile_java does that check.
+compile_java
+case "$JAVA_STATUS" in
+ok)
 	ran=$((ran + 1))
-	if "$JAVA" -cp "$JSON_JAR" "$HERE/CheckExtraKeys.java" "$ROOT/termux/termux.properties"; then
-		:
-	else
+	if ! "$JAVA" -cp "$JAVA_CP" CheckExtraKeys "$ROOT/termux/termux.properties"; then
 		failed=$((failed + 1))
 	fi
-else
+	;;
+fail)
+	ran=$((ran + 1))
+	failed=$((failed + 1))
+	;;
+*)
+	# Did not run. Counted as one skipped suite; the second Java check below
+	# refers back to this rather than repeating the reason.
+	ran=$((ran + 1))
 	skipped=$((skipped + 1))
-	printf '  SKIP  no usable JDK + org.json found (JAVA=%s JSON_JAR=%s)\n' \
-		"${JAVA:-unset}" "${JSON_JAR:-unset}"
-	printf '        To run this check:\n'
-	printf '          curl -sLo test/json.jar https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar\n'
-	printf '          JAVA=/path/to/java JSON_JAR=$PWD/test/json.jar %s\n' "$0"
-fi
+	;;
+esac
 
 # --- README key tables match the properties file ---------------------------
 #
@@ -137,18 +219,23 @@ fi
 # when they disagree again.
 
 printf '\n=== README key tables\n'
-if [ -n "$JAVA" ] && [ -x "$JAVA" ] && [ -n "$JSON_JAR" ] && [ -f "$JSON_JAR" ]; then
+case "$JAVA_STATUS" in
+ok)
 	ran=$((ran + 1))
-	if "$JAVA" -cp "$JSON_JAR" "$HERE/CheckReadmeTables.java" \
+	if ! "$JAVA" -cp "$JAVA_CP" CheckReadmeTables \
 		"$ROOT/termux/termux.properties" "$ROOT/README.md"; then
-		:
-	else
 		failed=$((failed + 1))
 	fi
-else
+	;;
+fail)
+	ran=$((ran + 1))
+	failed=$((failed + 1))
+	;;
+*)
 	skipped=$((skipped + 1))
-	printf '  SKIP  needs the JDK and org.json as above\n'
-fi
+	printf '  SKIP  needs the compiled checks above, which were skipped\n'
+	;;
+esac
 
 printf '\n===================================\n'
 if [ "$failed" -eq 0 ]; then
